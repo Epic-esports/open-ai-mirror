@@ -4,6 +4,7 @@ import { ChatMessage } from "@/components/chat/ChatMessage";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { WelcomeScreen } from "@/components/chat/WelcomeScreen";
 import { ChatHeader } from "@/components/chat/ChatHeader";
+import { useToast } from "@/hooks/use-toast";
 
 interface Message {
   id: string;
@@ -18,34 +19,15 @@ interface Conversation {
   timestamp: Date;
 }
 
-// Mock initial conversations
-const initialConversations: Conversation[] = [
-  {
-    id: "1",
-    title: "React best practices",
-    messages: [
-      { id: "1-1", role: "user", content: "What are the best practices for React?" },
-      { id: "1-2", role: "assistant", content: "Here are some key React best practices:\n\n1. **Use functional components** with hooks instead of class components\n2. **Keep components small and focused** - each component should do one thing well\n3. **Use proper state management** - useState for local state, context or Redux for global state\n4. **Memoize expensive computations** with useMemo and useCallback\n5. **Follow naming conventions** - PascalCase for components, camelCase for functions" },
-    ],
-    timestamp: new Date(),
-  },
-  {
-    id: "2",
-    title: "Python vs JavaScript",
-    messages: [
-      { id: "2-1", role: "user", content: "Compare Python and JavaScript" },
-      { id: "2-2", role: "assistant", content: "Both are excellent languages with different strengths:\n\n**Python:**\n- Great for data science, ML, and backend\n- Clean, readable syntax\n- Strong scientific computing libraries\n\n**JavaScript:**\n- Essential for web development\n- Runs in browsers and servers (Node.js)\n- Huge ecosystem with npm" },
-    ],
-    timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000),
-  },
-];
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
 
 const Index = () => {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [conversations, setConversations] = useState<Conversation[]>(initialConversations);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const { toast } = useToast();
 
   const activeConversation = conversations.find(c => c.id === activeConversationId);
 
@@ -72,6 +54,68 @@ const Index = () => {
     }
   };
 
+  const streamChat = async (
+    messages: Message[],
+    onDelta: (text: string) => void,
+    onDone: () => void
+  ) => {
+    const response = await fetch(CHAT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+      },
+      body: JSON.stringify({
+        messages: messages.map(m => ({ role: m.role, content: m.content })),
+      }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || "Failed to get AI response");
+    }
+
+    if (!response.body) throw new Error("No response body");
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let textBuffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      textBuffer += decoder.decode(value, { stream: true });
+
+      let newlineIndex: number;
+      while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
+        let line = textBuffer.slice(0, newlineIndex);
+        textBuffer = textBuffer.slice(newlineIndex + 1);
+
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line.startsWith(":") || line.trim() === "") continue;
+        if (!line.startsWith("data: ")) continue;
+
+        const jsonStr = line.slice(6).trim();
+        if (jsonStr === "[DONE]") {
+          onDone();
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(jsonStr);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) onDelta(content);
+        } catch {
+          textBuffer = line + "\n" + textBuffer;
+          break;
+        }
+      }
+    }
+
+    onDone();
+  };
+
   const handleSendMessage = async (content: string) => {
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -79,17 +123,19 @@ const Index = () => {
       content,
     };
 
-    if (activeConversationId) {
-      // Add message to existing conversation
+    let currentConversationId = activeConversationId;
+    let allMessages: Message[] = [];
+
+    if (currentConversationId) {
       setConversations(prev =>
         prev.map(c =>
-          c.id === activeConversationId
+          c.id === currentConversationId
             ? { ...c, messages: [...c.messages, userMessage] }
             : c
         )
       );
+      allMessages = [...(activeConversation?.messages || []), userMessage];
     } else {
-      // Create new conversation
       const newConversation: Conversation = {
         id: Date.now().toString(),
         title: content.slice(0, 30) + (content.length > 30 ? "..." : ""),
@@ -98,26 +144,51 @@ const Index = () => {
       };
       setConversations(prev => [newConversation, ...prev]);
       setActiveConversationId(newConversation.id);
+      currentConversationId = newConversation.id;
+      allMessages = [userMessage];
     }
 
-    // Simulate AI response
     setIsLoading(true);
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    let assistantContent = "";
 
-    const assistantMessage: Message = {
-      id: (Date.now() + 1).toString(),
-      role: "assistant",
-      content: generateMockResponse(content),
+    const updateAssistantMessage = (chunk: string) => {
+      assistantContent += chunk;
+      setConversations(prev =>
+        prev.map(c => {
+          if (c.id !== currentConversationId) return c;
+          const lastMessage = c.messages[c.messages.length - 1];
+          if (lastMessage?.role === "assistant") {
+            return {
+              ...c,
+              messages: c.messages.map((m, i) =>
+                i === c.messages.length - 1 ? { ...m, content: assistantContent } : m
+              ),
+            };
+          }
+          return {
+            ...c,
+            messages: [
+              ...c.messages,
+              { id: (Date.now() + 1).toString(), role: "assistant", content: assistantContent },
+            ],
+          };
+        })
+      );
     };
 
-    setConversations(prev =>
-      prev.map(c =>
-        c.id === (activeConversationId || prev[0]?.id)
-          ? { ...c, messages: [...c.messages, assistantMessage] }
-          : c
-      )
-    );
-    setIsLoading(false);
+    try {
+      await streamChat(allMessages, updateAssistantMessage, () => {
+        setIsLoading(false);
+      });
+    } catch (error) {
+      console.error("Chat error:", error);
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to get AI response",
+        variant: "destructive",
+      });
+      setIsLoading(false);
+    }
   };
 
   const handleSuggestionClick = (suggestion: string) => {
@@ -135,7 +206,6 @@ const Index = () => {
         isOpen={sidebarOpen}
       />
 
-      {/* Overlay for mobile */}
       {sidebarOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/50 md:hidden"
@@ -143,14 +213,12 @@ const Index = () => {
         />
       )}
 
-      {/* Main content */}
       <main className="flex flex-1 flex-col overflow-hidden">
         <ChatHeader
           onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
           onNewChat={handleNewChat}
         />
 
-        {/* Chat area */}
         <div className="flex-1 overflow-y-auto scrollbar-thin">
           {activeConversation ? (
             <div className="pb-32">
@@ -161,7 +229,7 @@ const Index = () => {
                   content={message.content}
                 />
               ))}
-              {isLoading && (
+              {isLoading && activeConversation.messages[activeConversation.messages.length - 1]?.role === "user" && (
                 <ChatMessage role="assistant" content="" isLoading />
               )}
               <div ref={messagesEndRef} />
@@ -171,7 +239,6 @@ const Index = () => {
           )}
         </div>
 
-        {/* Input area */}
         <div className="border-t border-transparent bg-background pt-2">
           <ChatInput onSend={handleSendMessage} disabled={isLoading} />
         </div>
@@ -179,15 +246,5 @@ const Index = () => {
     </div>
   );
 };
-
-function generateMockResponse(input: string): string {
-  const responses = [
-    `That's a great question! Let me help you with "${input.slice(0, 50)}...".\n\nHere's what I think:\n\n1. **First point**: This is an important consideration\n2. **Second point**: You should also think about this\n3. **Third point**: Don't forget about this aspect\n\nWould you like me to elaborate on any of these points?`,
-    `I'd be happy to help with that!\n\nBased on your question about "${input.slice(0, 30)}...", here are some insights:\n\n- Consider starting with the basics\n- Build up your understanding gradually\n- Practice consistently for best results\n\nLet me know if you need more specific guidance!`,
-    `Interesting topic! Here's my take on "${input.slice(0, 40)}...":\n\n## Overview\nThis is a fascinating area that involves several key concepts.\n\n## Key Points\n1. Understanding the fundamentals is crucial\n2. Practical application helps reinforce learning\n3. Staying updated with latest developments is important\n\nIs there a specific aspect you'd like to explore further?`,
-  ];
-  
-  return responses[Math.floor(Math.random() * responses.length)];
-}
 
 export default Index;
